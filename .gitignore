@@ -1,0 +1,18 @@
+# Runtime configuration and application data
+/backend/config.json
+/backend/data.json
+
+# Build outputs and packaged source
+/backend/dist/
+/backend/target/
+/backend/src.zip
+
+# Local assistant/tool state
+**/.claude/
+**/.codex-backups/
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
