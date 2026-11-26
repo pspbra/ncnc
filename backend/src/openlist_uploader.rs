@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 use tokio::fs::File;
 use tokio::sync::{mpsc, Mutex, OnceCell, RwLock, Semaphore};
 use tokio::task::JoinSet;
@@ -18,9 +19,8 @@ use tokio::time::{sleep, Duration};
 use tokio_util::io::ReaderStream;
 
 const CACHE_TTL: i64 = 600;
-const CACHE_FILE_PATH: &str = "openlist_cache.json";
 const CHANNEL_BUFFER: usize = 100;
-const CONCURRENCY: usize = 5;
+const CONCURRENCY: usize = 1;
 const UPLOAD_QPS: u64 = 5;
 const LIST_QPS: u64 = 3;
 
@@ -33,6 +33,11 @@ static UPLOAD_CONCURRENCY: Lazy<Semaphore> = Lazy::new(|| Semaphore::new(CONCURR
 static UPLOAD_LIMITER: Lazy<RateLimiter> = Lazy::new(|| RateLimiter::new(UPLOAD_QPS, 1));
 static LIST_LIMITER: Lazy<RateLimiter> = Lazy::new(|| RateLimiter::new(LIST_QPS, 1));
 static REMOVE_LIMITER: Lazy<RateLimiter> = Lazy::new(|| RateLimiter::new(LIST_QPS, 1));
+static SCANNED: Lazy<Mutex<HashMap<String, (u64, Instant)>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+static RECONCILED: Lazy<Mutex<HashMap<String, Instant>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+type SyncConfig = (String, u16, String, String);
+static SYNC_CONFIG: Lazy<Mutex<Option<SyncConfig>>> = Lazy::new(|| Mutex::new(None));
 
 pub async fn enqueue_upload(path: String) {
     let sender = SINGLE_UPLOAD_QUEUE
@@ -64,6 +69,100 @@ pub async fn enqueue_upload(path: String) {
     }
 }
 
+#[cfg(test)]
+mod io_tests {
+    use super::*;
+    use actix_web::{web, App, HttpResponse, HttpServer};
+
+    struct Remote {
+        listed: AtomicUsize,
+        removed: AtomicUsize,
+    }
+    async fn list(remote: web::Data<Remote>) -> HttpResponse {
+        remote.listed.fetch_add(1, Ordering::Relaxed);
+        HttpResponse::Ok().json(serde_json::json!({"message":"success", "data":{"content":[
+            {"name":"episode.mkv", "size":3, "is_dir":false},
+            {"name":"orphan.mkv", "size":3, "is_dir":false}
+        ]}}))
+    }
+    async fn remove(remote: web::Data<Remote>) -> HttpResponse {
+        remote.removed.fetch_add(1, Ordering::Relaxed);
+        HttpResponse::Ok().json(serde_json::json!({"code":200,"message":"success"}))
+    }
+
+    #[actix_web::test]
+    async fn unchanged_sync_skips_disk_scan_and_incomplete_scan_never_deletes() {
+        let root =
+            std::env::temp_dir().join(format!("ncnc-sync-test-{:032x}", rand::random::<u128>()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("episode.mkv"), b"123").unwrap();
+        std::fs::write(root.join("poster.jpg"), b"ignored").unwrap();
+        let remote = web::Data::new(Remote {
+            listed: AtomicUsize::new(0),
+            removed: AtomicUsize::new(0),
+        });
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let state = remote.clone();
+        let server = HttpServer::new(move || {
+            App::new()
+                .app_data(state.clone())
+                .route("/api/fs/list", web::post().to(list))
+                .route("/api/fs/remove", web::post().to(remove))
+        })
+        .listen(listener)
+        .unwrap()
+        .run();
+        let handle = server.handle();
+        actix_web::rt::spawn(server);
+        let mut config = Config::default();
+        config.openlist_address = "127.0.0.1".into();
+        config.openlist_port = port;
+        let config = Arc::new(config);
+        let client = Arc::new(Client::new());
+        for attempt in 0..3 {
+            if attempt == 2 {
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(root.join("missing"), root.join("broken.mkv")).unwrap();
+                SCANNED.lock().await.clear();
+                get_cache().write().await.clear();
+            }
+            let (sender, mut receiver) = mpsc::channel(100);
+            let compared = Arc::new(AtomicUsize::new(0));
+            let failed = Arc::new(AtomicUsize::new(0));
+            let deleted = Arc::new(AtomicUsize::new(0));
+            scan_dirs(
+                root.to_string_lossy().into_owned(),
+                sender,
+                config.clone(),
+                client.clone(),
+                compared.clone(),
+                failed.clone(),
+                deleted.clone(),
+            )
+            .await;
+            if attempt == 1 {
+                assert_eq!(compared.load(Ordering::Relaxed), 0);
+                assert_eq!(remote.listed.load(Ordering::Relaxed), 1);
+            } else {
+                assert_eq!(compared.load(Ordering::Relaxed), 1);
+                assert_eq!(receiver.recv().await.unwrap().src_size, 3);
+            }
+            if attempt == 0 {
+                assert_eq!(deleted.load(Ordering::Relaxed), 1);
+            }
+            #[cfg(unix)]
+            if attempt == 2 {
+                assert!(failed.load(Ordering::Relaxed) > 0);
+                assert_eq!(deleted.load(Ordering::Relaxed), 0);
+            }
+        }
+        assert_eq!(remote.removed.load(Ordering::Relaxed), 1);
+        handle.stop(true).await;
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
 fn get_cache() -> &'static Arc<RwLock<HashMap<String, CacheEntry>>> {
     CACHE.get_or_init(|| Arc::new(RwLock::new(HashMap::new())))
 }
@@ -76,11 +175,6 @@ fn get_cache_mutex() -> &'static Mutex<()> {
 struct CacheEntry {
     timestamp: i64,
     files: Arc<HashMap<String, u64>>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct CacheFile {
-    entries: HashMap<String, CacheEntry>,
 }
 
 #[derive(Clone)]
@@ -136,22 +230,7 @@ async fn load_cache() {
 }
 
 async fn load_cache_once() {
-    let _lock = get_cache_mutex().lock().await;
-
-    if !Path::new(CACHE_FILE_PATH).exists() {
-        return;
-    }
-
-    match tokio::fs::read_to_string(CACHE_FILE_PATH).await {
-        Ok(content) => match serde_json::from_str::<CacheFile>(&content) {
-            Ok(cache_file) => {
-                let mut cache = get_cache().write().await;
-                *cache = cache_file.entries;
-            }
-            Err(_) => {}
-        },
-        Err(_) => {}
-    }
+    // Remote listings are cheap to rebuild and expire after ten minutes.
 }
 
 async fn save_cache() {
@@ -160,19 +239,6 @@ async fn save_cache() {
     let mut cache = get_cache().write().await;
     let now = Utc::now().timestamp();
     cache.retain(|_, entry| now - entry.timestamp < CACHE_TTL);
-    let cache_file = CacheFile {
-        entries: cache.clone(),
-    };
-    drop(cache);
-
-    if let Err(error) = crate::io_util::blocking(move || {
-        crate::io_util::atomic_json(Path::new(CACHE_FILE_PATH), &cache_file)
-    })
-    .await
-    .unwrap_or_else(|error| Err(std::io::Error::other(error)))
-    {
-        error!("[OpenList上传] 保存缓存失败: {}", error);
-    }
 }
 
 fn is_media_or_subtitle_file(path: &str) -> bool {
@@ -339,7 +405,7 @@ async fn upload_single_file_internal(
         Ok(metadata) => metadata.len(),
         Err(_) => return false,
     };
-    let stream = ReaderStream::new(file);
+    let stream = ReaderStream::with_capacity(file, 256 * 1024);
     let body = reqwest::Body::wrap_stream(stream);
 
     UPLOAD_LIMITER.acquire().await;
@@ -507,8 +573,15 @@ async fn scan_dirs(
 
     while let Some(dir) = stack.pop() {
         let path = Path::new(&dir);
-
-        if !path.is_dir() {
+        let watch_root = root.clone();
+        let watch_path = dir.clone();
+        let revision = crate::io_util::blocking(move || {
+            crate::filesystem_index::revision(Path::new(&watch_root), Path::new(&watch_path))
+        })
+        .await
+        .ok()
+        .flatten();
+        if crate::filesystem_index::fresh(SCANNED.lock().await.get(&dir).copied(), revision) {
             continue;
         }
 
@@ -525,13 +598,17 @@ async fn scan_dirs(
 
         let remote_map = match get_remote_file_dict(&remote_dir_path, &config, &client).await {
             Some(m) => m,
-            None => continue,
+            None => {
+                failed_count.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
         };
 
         let mut rd = match tokio::fs::read_dir(path).await {
             Ok(r) => r,
             Err(e) => {
                 error!("[OpenList上传] 读取目录失败 {}: {}", dir, e);
+                failed_count.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
         };
@@ -545,8 +622,8 @@ async fn scan_dirs(
             match rd.next_entry().await {
                 Ok(Some(entry)) => {
                     let p = entry.path();
-                    let metadata = match tokio::fs::metadata(&p).await {
-                        Ok(metadata) => metadata,
+                    let file_type = match entry.file_type().await {
+                        Ok(file_type) => file_type,
                         Err(_) => {
                             scan_complete = false;
                             failed_count.fetch_add(1, Ordering::Relaxed);
@@ -554,7 +631,7 @@ async fn scan_dirs(
                         }
                     };
 
-                    if metadata.is_dir() {
+                    if file_type.is_dir() {
                         if let Some(path_str) = p.to_str() {
                             subdirs.push(path_str.to_string());
                         } else {
@@ -568,6 +645,19 @@ async fn scan_dirs(
                     if !is_media_or_subtitle_file(&file) {
                         continue;
                     }
+                    if !file_type.is_file() {
+                        // Uncertain entries must never authorize remote deletion.
+                        scan_complete = false;
+                        continue;
+                    }
+                    let metadata = match entry.metadata().await {
+                        Ok(metadata) => metadata,
+                        Err(_) => {
+                            scan_complete = false;
+                            failed_count.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                    };
 
                     let filename = match p.file_name().and_then(|s| s.to_str()) {
                         Some(s) => s.to_string(),
@@ -622,6 +712,21 @@ async fn scan_dirs(
             let removed =
                 remove_remote_files(&remote_dir_path, &remote_only, &config, &client).await;
             deleted_count.fetch_add(removed, Ordering::Relaxed);
+            if removed != remote_only.len() {
+                scan_complete = false;
+                failed_count.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        if scan_complete {
+            if let Some(revision) = revision {
+                SCANNED
+                    .lock()
+                    .await
+                    .insert(dir.clone(), (revision, Instant::now()));
+            }
+        } else {
+            failed_count.fetch_add(1, Ordering::Relaxed);
         }
 
         for subdir in subdirs.into_iter().rev() {
@@ -715,7 +820,7 @@ impl OpenListUploadManager {
                         );
                         last_hour = Some(current_hour);
 
-                        Self::execute_upload_all().await;
+                        Self::execute_upload_all(false).await;
                     }
                 } else {
                     drop(config);
@@ -729,18 +834,39 @@ impl OpenListUploadManager {
     pub async fn execute_now() {
         info!("[OpenList上传] 立即执行一次完整上传");
         load_cache().await;
-        Self::execute_upload_all().await;
+        Self::execute_upload_all(true).await;
     }
 
-    async fn execute_upload_all() {
+    async fn execute_upload_all(force: bool) {
         let _execution = EXECUTION_LOCK.lock().await;
+        if force {
+            SCANNED.lock().await.clear();
+        }
         load_cache().await;
         let config = Arc::new(CONFIG.read().await.clone());
         let media_root = config.media_library_path.clone();
-
-        if !Path::new(&media_root).exists() {
-            error!("[OpenList上传] 媒体库目录不存在: {}", media_root);
-            return;
+        let key = (
+            config.openlist_address.clone(),
+            config.openlist_port,
+            config.openlist_apikey.clone(),
+            media_root.clone(),
+        );
+        let mut previous = SYNC_CONFIG.lock().await;
+        if previous.as_ref() != Some(&key) {
+            SCANNED.lock().await.clear();
+            RECONCILED.lock().await.clear();
+            get_cache().write().await.clear();
+            *previous = Some(key);
+        }
+        drop(previous);
+        let full = force
+            || RECONCILED
+                .lock()
+                .await
+                .get(&media_root)
+                .is_none_or(|time| time.elapsed() >= crate::filesystem_index::RECONCILE);
+        if full {
+            SCANNED.lock().await.clear();
         }
 
         let client_guard = CLIENT.read().await;
@@ -766,6 +892,7 @@ impl OpenListUploadManager {
         let (tx, mut rx) = mpsc::channel::<UploadTask>(CHANNEL_BUFFER);
 
         let scan_task = tokio::spawn({
+            let media_root = media_root.clone();
             let tx = tx.clone();
             let config = config.clone();
             let client = client.clone();
@@ -825,6 +952,11 @@ impl OpenListUploadManager {
             failed_count.fetch_add(1, Ordering::Relaxed);
         }
         wait_for_uploads(&mut uploads, &failed_count).await;
+        if failed_count.load(Ordering::Relaxed) > 0 {
+            SCANNED.lock().await.clear();
+        } else if full {
+            RECONCILED.lock().await.insert(media_root, Instant::now());
+        }
         save_cache().await;
 
         let uploaded = uploaded_count.load(Ordering::Relaxed);
