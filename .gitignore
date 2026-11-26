@@ -7,6 +7,9 @@
 /backend/target/
 /backend/src.zip
 
+# Internal documentation (contains server credentials; never publish)
+**/开发说明.md
+
 # Local assistant/tool state
 **/.claude/
 **/.codex-backups/

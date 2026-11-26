@@ -74,8 +74,6 @@ npm run test:unit    # Vitest 单元测试
 npm run test:e2e     # Playwright 端到端测试
 ```
 
-详细的目录结构、页面说明、API 封装和开发约定请参阅 [开发说明.md](开发说明.md)。
-
 ## 技术栈
 
 Vue 3 · TypeScript · Vite · Pinia · Vue Router · Naive UI · Axios

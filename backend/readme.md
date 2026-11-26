@@ -86,7 +86,7 @@ cp -r dist/. ../backend/webui/
 - 代理、自动下载、RSS、自动上传与媒体压缩开关
 - 登录账号、密码哈希与 JWT 密钥
 
-`config.json`、`data.json` 等运行数据不会提交到 Git。完整配置字段、API、处理流程和故障排查请参阅 [开发说明.md](开发说明.md)。
+`config.json`、`data.json` 等运行数据不会提交到 Git。
 
 ## 技术栈
 

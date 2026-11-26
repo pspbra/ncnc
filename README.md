@@ -5,7 +5,7 @@ NCNC 是一个自托管的媒体订阅、下载与整理服务，主要面向电
 - **后端** `backend/`：Rust + Actix Web + Tokio，负责元数据聚合、资源搜索、下载调度、转码整理与云端同步，同时托管 WebUI。
 - **前端** `frontend/`：Vue 3 + TypeScript + Vite 管理界面，构建后以静态文件形式由后端提供。
 
-后端源码说明见 [backend/README.md](backend/README.md)，字段、API 与处理流程见 [backend/开发说明.md](backend/开发说明.md)，前端见 [frontend/README.md](frontend/README.md)。
+后端源码说明见 [backend/README.md](backend/README.md)，前端见 [frontend/README.md](frontend/README.md)。
 
 ## 运行环境
 
