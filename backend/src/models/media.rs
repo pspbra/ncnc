@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct SeasonInfo {
     pub name: String,
     pub episode_count: i32,
@@ -12,7 +12,7 @@ pub struct SeasonInfo {
     pub season_number: i32,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct EpisodeInfo {
     pub air_date: Option<String>,
     #[serde(default, flatten)]
@@ -45,7 +45,7 @@ pub struct EpisodeAirTime {
     pub time_zone_used: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct MediaInfo {
     pub tmdbid: u32,
     pub tvdb_series_id: Option<u32>,
@@ -87,7 +87,7 @@ pub struct MediaSettingsResponse {
     pub message: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Default, Clone)]
+#[derive(Serialize, Deserialize, Default, Clone, PartialEq)]
 pub struct DataJson {
     pub media: HashMap<u32, Arc<MediaInfo>>,
 }

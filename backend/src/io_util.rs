@@ -43,7 +43,7 @@ pub fn atomic_json<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
             .create_new(true)
             .open(&temporary)?;
         let mut writer = BufWriter::with_capacity(64 * 1024, file);
-        serde_json::to_writer_pretty(&mut writer, value).map_err(io::Error::other)?;
+        serde_json::to_writer(&mut writer, value).map_err(io::Error::other)?;
         writer.flush()?;
         #[cfg(unix)]
         match fs::metadata(path) {

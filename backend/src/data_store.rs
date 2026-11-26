@@ -13,10 +13,50 @@ pub struct DataStore {
     writer: Mutex<()>,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn unchanged_mutations_do_not_advance_version_or_write() {
+        let store = DataStore::new(DataJson::default());
+        {
+            let mut data = store.write().await;
+            data.media.remove(&42);
+        }
+        assert_eq!(store.version(), 0);
+        let path = std::env::temp_dir().join(format!("ncnc-data-{}.json", rand::random::<u64>()));
+        assert!(!store.save_to(path.clone()).await.unwrap());
+        assert!(!path.exists());
+        let media = serde_json::from_value(serde_json::json!({
+            "tmdbid": 42, "tvdb_series_id": null, "name": "test", "original_name": "test",
+            "name_tw": "test", "poster_path": null, "optional_names": [], "media_path": "/tmp/test",
+            "number_of_seasons": 0, "seasons": [], "display_name": "test"
+        }))
+        .unwrap();
+        {
+            store
+                .write()
+                .await
+                .media
+                .insert(42, std::sync::Arc::new(media));
+        }
+        assert_eq!(store.version(), 1);
+        {
+            let mut data = store.write().await;
+            std::sync::Arc::make_mut(data.media.get_mut(&42).unwrap()).name = "test".into();
+        }
+        assert_eq!(store.version(), 1);
+        assert!(store.save_to(path.clone()).await.unwrap());
+        assert!(!store.save_to(path.clone()).await.unwrap());
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
 pub struct DataWriteGuard<'a> {
     guard: RwLockWriteGuard<'a, DataJson>,
     version: &'a AtomicU64,
-    modified: bool,
+    original: Option<DataJson>,
 }
 
 impl Deref for DataWriteGuard<'_> {
@@ -27,13 +67,19 @@ impl Deref for DataWriteGuard<'_> {
 }
 impl DerefMut for DataWriteGuard<'_> {
     fn deref_mut(&mut self) -> &mut DataJson {
-        self.modified = true;
+        if self.original.is_none() {
+            self.original = Some(self.guard.clone());
+        }
         &mut self.guard
     }
 }
 impl Drop for DataWriteGuard<'_> {
     fn drop(&mut self) {
-        if self.modified {
+        if self
+            .original
+            .as_ref()
+            .is_some_and(|old| old != &*self.guard)
+        {
             self.version.fetch_add(1, Ordering::Release);
         }
     }
@@ -55,7 +101,7 @@ impl DataStore {
         DataWriteGuard {
             guard: self.data.write().await,
             version: &self.version,
-            modified: false,
+            original: None,
         }
     }
     pub fn version(&self) -> u64 {

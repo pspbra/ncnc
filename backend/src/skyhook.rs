@@ -429,7 +429,7 @@ async fn get_series_cached(
             let saved = cache.clone();
             let save_result = crate::io_util::blocking(move || {
                 std::fs::create_dir_all(path.parent().unwrap())?;
-                crate::io_util::atomic_json(&path, &saved)
+                crate::io_util::atomic_json_relaxed(&path, &saved)
             })
             .await;
             if !matches!(save_result, Ok(Ok(()))) {
