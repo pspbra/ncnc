@@ -232,7 +232,7 @@ async fn main() -> std::io::Result<()> {
         loop {
             tokio::select! {
                 _ = save_stop_worker.notified() => break,
-                _ = tokio::time::sleep(tokio::time::Duration::from_secs(5)) => save_data_json().await,
+                _ = tokio::time::sleep(tokio::time::Duration::from_secs(30)) => save_data_json().await,
             }
         }
     });

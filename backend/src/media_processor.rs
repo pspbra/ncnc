@@ -652,10 +652,11 @@ async fn prepare(
     } else {
         None
     };
-    let generate = remux
-        || plan
-            .as_ref()
-            .is_some_and(|p| p.video_compress || p.audio_compress || !p.subtitles.is_empty());
+    let generate_media = remux
+        || plan.as_ref().is_some_and(|p| {
+            p.video_compress || p.audio_compress || p.preferred_audio_order.is_some()
+        });
+    let generate = generate_media || plan.as_ref().is_some_and(|p| !p.subtitles.is_empty());
     tx.outputs.clear();
     if let Some(plan) = &plan {
         let stem = target
@@ -672,7 +673,7 @@ async fn prepare(
         }
     }
     tx.outputs.push(Output {
-        temporary: if generate {
+        temporary: if generate_media {
             work.join(format!(
                 "media.{}",
                 target.extension().unwrap_or_default().to_string_lossy()
@@ -688,7 +689,14 @@ async fn prepare(
         let (ffmpeg, ffprobe) = paths.ok_or_else(|| invalid("媒体工具缺失"))?;
         let plan = plan.as_ref().unwrap();
         let timeout = Duration::from_secs(24 * 60 * 60);
-        if !combine && !plan.subtitles.is_empty() {
+        if !generate_media {
+            run_command(
+                &mut ffmpeg_command(ffmpeg, &tx.source, plan, &tx.outputs, false, true),
+                timeout,
+                0,
+            )
+            .await?;
+        } else if !combine && !plan.subtitles.is_empty() {
             run_command(
                 &mut ffmpeg_command(ffmpeg, &tx.source, plan, &tx.outputs, false, true),
                 timeout,
@@ -709,7 +717,11 @@ async fn prepare(
             )
             .await?;
         }
-        for output in &tx.outputs {
+        for output in tx
+            .outputs
+            .iter()
+            .filter(|output| output.temporary != tx.source)
+        {
             let mut file = fs::OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -727,38 +739,40 @@ async fn prepare(
             }
         }
         // Probe the generated output (not the input again) to reject invalid muxes.
-        let output_probe = read_probe(ffprobe, &tx.outputs.last().unwrap().temporary).await?;
-        if output_probe
-            .streams
-            .iter()
-            .filter(|s| s.codec_type == "video")
-            .count()
-            != 1
-            || output_probe
+        if generate_media {
+            let output_probe = read_probe(ffprobe, &tx.outputs.last().unwrap().temporary).await?;
+            if output_probe
                 .streams
                 .iter()
-                .filter(|s| s.codec_type == "audio")
+                .filter(|s| s.codec_type == "video")
                 .count()
-                != plan.audio_count
-            || output_probe
-                .streams
-                .iter()
-                .filter(|s| s.codec_type == "subtitle")
-                .count()
-                != plan.embedded_pgs.len()
-            || output_probe
-                .streams
-                .iter()
-                .filter(|s| s.codec_type == "subtitle")
-                .any(|s| s.codec_name.as_deref() != Some("hdmv_pgs_subtitle"))
-            || output_probe
-                .format
-                .and_then(|f| f.duration)
-                .and_then(|d| d.parse::<f64>().ok())
-                .filter(|d| d.is_finite() && *d > 0.0)
-                .is_none()
-        {
-            return Err(invalid("生成媒体的流数量或时长无效"));
+                != 1
+                || output_probe
+                    .streams
+                    .iter()
+                    .filter(|s| s.codec_type == "audio")
+                    .count()
+                    != plan.audio_count
+                || output_probe
+                    .streams
+                    .iter()
+                    .filter(|s| s.codec_type == "subtitle")
+                    .count()
+                    != plan.embedded_pgs.len()
+                || output_probe
+                    .streams
+                    .iter()
+                    .filter(|s| s.codec_type == "subtitle")
+                    .any(|s| s.codec_name.as_deref() != Some("hdmv_pgs_subtitle"))
+                || output_probe
+                    .format
+                    .and_then(|f| f.duration)
+                    .and_then(|d| d.parse::<f64>().ok())
+                    .filter(|d| d.is_finite() && *d > 0.0)
+                    .is_none()
+            {
+                return Err(invalid("生成媒体的流数量或时长无效"));
+            }
         }
         if Stamp::read(&tx.source).await? != tx.source_stamp {
             return Err(invalid("处理期间输入发生变化"));
@@ -1258,5 +1272,55 @@ mod workspace_tests {
             ProcessOutcome::Deferred(_)
         ));
         assert!(!target.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "requires FFmpeg/FFprobe; run explicitly on Linux"]
+    async fn subtitle_extraction_moves_original_video_without_rewriting() {
+        use std::os::unix::fs::MetadataExt;
+        let root = TestDirectory::new();
+        fs::create_dir_all(&root.0).await.unwrap();
+        let source = root.0.join("source.mkv");
+        let subtitle = root.0.join("source.srt");
+        fs::write(&subtitle, "1\n00:00:00,000 --> 00:00:01,000\n字幕测试\n")
+            .await
+            .unwrap();
+        let status = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=size=64x64:rate=10",
+                "-i",
+            ])
+            .arg(&subtitle)
+            .args([
+                "-map", "0:v", "-map", "1:s", "-c:v", "libx264", "-c:s", "srt", "-t", "2",
+            ])
+            .arg(&source)
+            .status()
+            .await
+            .unwrap();
+        assert!(status.success());
+        let before = fs::read(&source).await.unwrap();
+        let inode = fs::metadata(&source).await.unwrap().ino();
+        let target = root.0.join("library/episode.mkv");
+        let old_enabled = CONFIG.read().await.media_auto_compress;
+        CONFIG.write().await.media_auto_compress = true;
+        let outcome = process_inner(&source, &target, &root.0.join("backup"), true).await;
+        CONFIG.write().await.media_auto_compress = old_enabled;
+        assert!(outcome.unwrap().is_success());
+        assert_eq!(fs::metadata(&target).await.unwrap().ino(), inode);
+        assert_eq!(fs::read(&target).await.unwrap(), before);
+        assert!(
+            fs::read_to_string(target.with_file_name("episode.track1.ass"))
+                .await
+                .unwrap()
+                .contains("字幕测试")
+        );
+        assert!(!source.exists());
     }
 }

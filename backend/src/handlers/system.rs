@@ -29,14 +29,14 @@ pub async fn start_system_monitor() {
             let media_path = CONFIG.read().await.media_library_path.clone();
             let temperature = get_disk_temperature(&media_path).await;
             *TEMPERATURE.write().await = (media_path, temperature);
-            tokio::time::sleep(Duration::from_secs(60)).await;
+            tokio::time::sleep(Duration::from_secs(600)).await;
         }
     });
     let mut system = System::new();
     let mut interval = tokio::time::interval(Duration::from_secs(1));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_discovery = Instant::now() - Duration::from_secs(60);
-    let mut last_disk = Instant::now() - Duration::from_secs(15);
+    let mut last_disk = Instant::now() - Duration::from_secs(60);
     let mut previous_path = String::new();
     let mut canonical_path = None;
     let mut disk_info = (0, 0, 0, 0.0);
@@ -45,9 +45,11 @@ pub async fn start_system_monitor() {
         let media_path = CONFIG.read().await.media_library_path.clone();
         let discover =
             previous_path != media_path || last_discovery.elapsed() >= Duration::from_secs(60);
-        let sample_disk = discover || last_disk.elapsed() >= Duration::from_secs(15);
+        let sample_disk = discover || last_disk.elapsed() >= Duration::from_secs(60);
         if discover {
-            canonical_path = tokio::fs::canonicalize(&media_path).await.ok();
+            if previous_path != media_path || canonical_path.is_none() {
+                canonical_path = tokio::fs::canonicalize(&media_path).await.ok();
+            }
             previous_path = media_path.clone();
             last_discovery = Instant::now();
         }
@@ -194,9 +196,27 @@ fn mount_device(path: &Path, mounts: &str) -> Option<String> {
 }
 
 async fn get_disk_temperature(path: &str) -> Option<f32> {
-    let canonical = tokio::fs::canonicalize(path).await.ok()?;
+    // Cache path resolution; resolving paths on the media disk before checking
+    // standby could otherwise defeat the non-waking SMART query.
+    static DEVICE: Lazy<tokio::sync::Mutex<Option<(String, String, String)>>> =
+        Lazy::new(|| tokio::sync::Mutex::new(None));
+    static TYPES: Lazy<RwLock<std::collections::HashMap<String, String>>> =
+        Lazy::new(|| RwLock::new(std::collections::HashMap::new()));
     let mounts = tokio::fs::read_to_string("/proc/mounts").await.ok()?;
-    let device = mount_device(&canonical, &mounts)?;
+    let mut cached = DEVICE.lock().await;
+    let device = if let Some((old_path, old_mounts, device)) = cached
+        .as_ref()
+        .filter(|(old_path, old_mounts, _)| old_path == path && old_mounts == &mounts)
+    {
+        let _ = (old_path, old_mounts);
+        device.clone()
+    } else {
+        let canonical = tokio::fs::canonicalize(path).await.ok()?;
+        let device = mount_device(&canonical, &mounts)?;
+        *cached = Some((path.to_owned(), mounts, device.clone()));
+        device
+    };
+    drop(cached);
     if !device.starts_with("/dev/") {
         return None;
     }
@@ -210,9 +230,32 @@ async fn get_disk_temperature(path: &str) -> Option<f32> {
         } else {
             Command::new("/usr/sbin/smartctl")
         };
-        command.args(["-a", "-j", &device]).kill_on_drop(true);
+        if let Some(device_type) = TYPES.read().await.get(&device).cloned() {
+            // SAT autodetection can itself wake some USB bridges.
+            command.args(["-d", &device_type]);
+        }
+        command
+            .args(["-n", "standby,3", "-a", "-j", &device])
+            .kill_on_drop(true);
         match tokio::time::timeout(Duration::from_secs(10), command.output()).await {
             Ok(Ok(output)) => {
+                if let Some(device_type) =
+                    serde_json::from_slice::<serde_json::Value>(&output.stdout)
+                        .ok()
+                        .and_then(|report| {
+                            report
+                                .get("device")?
+                                .get("type")?
+                                .as_str()
+                                .map(str::to_owned)
+                        })
+                {
+                    TYPES.write().await.insert(device.clone(), device_type);
+                }
+                // The explicit standby status is not an access failure: do not retry or wake it.
+                if output.status.code() == Some(3) {
+                    return None;
+                }
                 if let Some(value) = smart_temperature(&output.stdout, output.status.code()) {
                     return Some(value);
                 }
