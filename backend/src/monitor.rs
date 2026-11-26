@@ -756,7 +756,7 @@ impl Monitor {
         }
     }
 
-    async fn process_media_directory(dir: &Path) -> usize {
+    async fn process_media_directory(dir: &Path) -> (usize, bool) {
         let permit = DIRECTORY_SCANS
             .clone()
             .acquire_owned()
@@ -767,11 +767,16 @@ impl Monitor {
         let producer = tokio::spawn(async move {
             let _permit = permit;
             crate::io_util::blocking(move || {
-                for entry in WalkDir::new(directory)
-                    .follow_links(false)
-                    .into_iter()
-                    .flatten()
-                {
+                let mut complete = true;
+                for entry in WalkDir::new(directory).follow_links(false).into_iter() {
+                    let entry = match entry {
+                        Ok(entry) => entry,
+                        Err(error) => {
+                            error!("[自动下载扫描] 读取目录失败: {}", error);
+                            complete = false;
+                            continue;
+                        }
+                    };
                     let path = entry.path();
                     if !entry.file_type().is_file()
                         && !(entry.file_type().is_symlink() && path.is_file())
@@ -787,10 +792,12 @@ impl Monitor {
                         || COMMON_CAPTION_EXTS_SET.contains(extension.as_str())
                     {
                         if sender.blocking_send(path.to_path_buf()).is_err() {
+                            complete = false;
                             break;
                         }
                     }
                 }
+                complete
             })
             .await
         });
@@ -799,15 +806,28 @@ impl Monitor {
             count += 1;
             Self::process_autodownload_file(&file).await;
         }
-        match producer.await {
-            Ok(Ok(())) => {}
-            result => error!("[自动下载扫描] 目录扫描任务失败: {:?}", result),
-        }
-        count
+        let complete = match producer.await {
+            Ok(Ok(complete)) => complete,
+            result => {
+                error!("[自动下载扫描] 目录扫描任务失败: {:?}", result);
+                false
+            }
+        };
+        (count, complete)
     }
 
     pub async fn scan_autodownload_folder() {
         let base_dir = Path::new("/mnt/8tb/autodownload/");
+        static EMPTY_SCAN: Lazy<tokio::sync::Mutex<Option<(u64, std::time::Instant)>>> =
+            Lazy::new(|| tokio::sync::Mutex::new(None));
+        let revision =
+            crate::io_util::blocking(move || crate::filesystem_index::revision(base_dir, base_dir))
+                .await
+                .ok()
+                .flatten();
+        if crate::filesystem_index::fresh(*EMPTY_SCAN.lock().await, revision) {
+            return;
+        }
         if !fs::try_exists(base_dir).await.unwrap_or(false) {
             debug!("[自动下载扫描] 目录不存在: {}", base_dir.display());
             return;
@@ -815,7 +835,14 @@ impl Monitor {
 
         debug!("[自动下载扫描] 开始扫描目录: {}", base_dir.display());
 
-        let count = Self::process_media_directory(base_dir).await;
+        let (count, complete) = Self::process_media_directory(base_dir).await;
+        if count == 0 && complete {
+            if let Some(revision) = revision {
+                *EMPTY_SCAN.lock().await = Some((revision, std::time::Instant::now()));
+            }
+        } else {
+            *EMPTY_SCAN.lock().await = None;
+        }
         info!("[自动下载扫描] 扫描完成，找到 {} 个候选文件", count);
 
         debug!("[自动下载扫描] 扫描处理完成");

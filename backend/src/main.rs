@@ -24,6 +24,7 @@ mod auto_download;
 mod auto_rss;
 mod data_store;
 mod download_cache;
+mod filesystem_index;
 mod handlers;
 mod io_util;
 mod logging;

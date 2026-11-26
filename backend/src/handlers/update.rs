@@ -7,11 +7,18 @@ use crate::{CLIENT, CONFIG, DATA_JSON};
 use actix_web::{web, HttpResponse};
 use futures_util::{stream, StreamExt};
 use log::{debug, error};
+use once_cell::sync::Lazy;
 use once_cell::sync::OnceCell;
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
+use tokio::sync::Mutex;
+
+type FileKeys = HashSet<(i32, i32)>;
+static FILE_INDEX: Lazy<Mutex<HashMap<String, (Option<u64>, Instant, FileKeys)>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 
 const TMDB_API_QPS: u64 = 3;
 const TMDB_API_MAX_PERMITS: usize = 3;
@@ -62,9 +69,28 @@ fn collect_media_files(dir: &Path) -> Result<HashSet<(i32, i32)>, String> {
 }
 
 async fn scan_media_files(path: String) -> Result<HashSet<(i32, i32)>, String> {
-    crate::io_util::blocking(move || collect_media_files(Path::new(&path)))
+    let root = CONFIG.read().await.media_library_path.clone();
+    let scan_path = path.clone();
+    let revision = crate::io_util::blocking(move || {
+        crate::filesystem_index::revision(Path::new(&root), Path::new(&scan_path))
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    let mut index = FILE_INDEX.lock().await;
+    if let Some((old, time, keys)) = index.get(&path) {
+        if crate::filesystem_index::fresh(old.map(|v| (v, *time)), revision) {
+            return Ok(keys.clone());
+        }
+    }
+    let scan_path = path.clone();
+    let keys = crate::io_util::blocking(move || collect_media_files(Path::new(&scan_path)))
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())??;
+    if index.len() >= 1024 {
+        index.clear();
+    }
+    index.insert(path, (revision, Instant::now(), keys.clone()));
+    Ok(keys)
 }
 
 pub async fn mark_episode_exists(tmdbid: u32, season_number: i32, episode_number: i32, path: &str) {

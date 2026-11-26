@@ -29,6 +29,7 @@ quick-xml = "0.36"
 dashmap = "6"
 log = "0.4"
 env_logger = "0.10"
+notify = { version = "8.2", default-features = false }
 
 [profile.release]
 opt-level = "z"
