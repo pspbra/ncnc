@@ -412,6 +412,9 @@ async fn main() -> std::io::Result<()> {
     RUNTIME_STATE
         .save_to(runtime_state::RUNTIME_STATE_PATH.into())
         .await?;
+    io_util::blocking(logging::flush_pending)
+        .await
+        .map_err(std::io::Error::other)??;
     if RESTART_REQUESTED.load(Ordering::Acquire) {
         std::process::Command::new(std::env::current_exe()?)
             .args(std::env::args().skip(1))
