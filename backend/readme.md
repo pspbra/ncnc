@@ -23,19 +23,30 @@ NCNC 的媒体订阅、下载与整理后端，使用 Rust、Actix Web 和 Tokio
 
 ## 编译
 
+发布产物使用 **musl + rustls** 静态链接，不依赖 glibc、libssl 等动态库，可在任意 x86-64 Linux（含 Alpine、CentOS 7、Ubuntu 20.04 等）上直接运行。需要一次性准备：
+
 ```bash
-cd backend
-cargo build --release --locked
+rustup target add x86_64-unknown-linux-musl
+apt-get install -y musl-tools lld   # 提供 musl-gcc 与 ld.lld
 ```
 
-二进制文件生成在 `target/release/ncnc`。也可以使用发布脚本生成精简文件：
+然后执行发布脚本：
 
 ```bash
+cd backend
 chmod +x build-release.sh
 ./build-release.sh
 ```
 
-发布文件会写入 `dist/ncnc`，脚本结束时会清理 Cargo 构建目录。
+脚本会设置 `RUSTFLAGS="-C linker=ld.lld -C target-feature=+crt-static"`、`CC_x86_64_unknown_linux_musl=musl-gcc`，构建 `x86_64-unknown-linux-musl` 目标，把 static-pie 产物写入 `dist/ncnc`（约 9.8 MiB），结束时清理该目标的 `target/` 构建目录。**必须使用 `ld.lld` 链接**：binutils `ld` 链接出的 static-pie 会启动即崩溃。
+
+开发调试仍可用宿主机默认目标：
+
+```bash
+cargo build --release --locked          # target/release/ncnc
+```
+
+注意：musl 产物里没有 OpenSSL，HTTPS 由 rustls 加内置 webpki 根证书完成，不读取系统 CA 存储。
 
 ## 运行
 

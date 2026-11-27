@@ -9,7 +9,7 @@ NCNC 是一个自托管的媒体订阅、下载与整理服务，主要面向电
 
 ## 运行环境
 
-只支持 Linux（x86_64）。发布二进制为动态链接，需要 glibc 2.34 及以上与 OpenSSL 3（`libssl.so.3`）。
+只支持 Linux（x86_64）。发布二进制为 **musl + rustls 静态链接**（static-pie），不依赖 glibc、OpenSSL 等动态库，可在任意 x86-64 Linux 上直接运行。HTTPS 根证书使用 rustls 内置的 webpki-roots，不读取系统 CA 存储。
 
 | 依赖 | 说明 |
 | --- | --- |
@@ -65,10 +65,16 @@ RUST_LOG=info ./ncnc
 
 后端：
 
+需要一次性准备 musl 目标与链接器：
+
 ```bash
+rustup target add x86_64-unknown-linux-musl
+apt-get install -y musl-tools lld
 cd backend
-./build-release.sh          # 产物为 dist/ncnc，脚本结束后清理 target/
+./build-release.sh          # 产物为静态链接的 dist/ncnc，脚本结束后清理该 target 的构建目录
 ```
+
+脚本固定使用 `ld.lld` 链接 musl static-pie 目标；换回 binutils `ld` 会让产物启动即崩溃。
 
 前端：
 
